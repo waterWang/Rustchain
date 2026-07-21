@@ -1,0 +1,34 @@
+name: Link Check
+
+on:
+  pull_request:
+    paths:
+      - '**.md'
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  link-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Link Checker
+        uses: lycheeverse/lychee-action@v2
+        with:
+          args: >-
+            --verbose
+            --no-progress
+            --exclude 'https://doi.org'
+            --exclude 'https://img.shields.io'
+            --exclude 'https://github.com/Scottcjn/Rustchain'
+            --exclude 'https://rustchain.org'
+            --exclude 'https://www.youtube.com'
+            --exclude 'https://x.com'
+            --exclude 'https://twitter.com'
+            --exclude 'https://www.google.com'
+            --exclude 'https://github.com/waterWang'
+            ./**/*.md
+          fail: true
+        env:
+          GITHUB_TOKEN: \${{ secrets.GITHUB_TOKEN }}
