@@ -52,6 +52,9 @@ pub enum WalletError {
 
     #[error("Hex decode error: {0}")]
     HexDecode(#[from] hex::FromHexError),
+
+    #[error("Wallet not found: {0}")]
+    WalletNotFound(String),
 }
 
 impl From<ed25519_dalek::SignatureError> for WalletError {

@@ -143,6 +143,9 @@ impl RustChainClient {
             .await
             .map_err(|e| WalletError::Network(format!("Balance request failed: {}", e)))?;
 
+        if response.status().as_u16() == 404 {
+            return Err(WalletError::WalletNotFound(address.to_string()));
+        }
         if !response.status().is_success() {
             return Err(WalletError::Network(format!(
                 "Balance query returned HTTP {}",
