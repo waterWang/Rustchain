@@ -2,9 +2,17 @@
 //!
 //! A command-line interface for managing RustChain wallets,
 //! signing transactions, and interacting with the network.
+//!
+//! Exit codes (documented in --help):
+//!   0 = success
+//!   1 = usage / input error
+//!   2 = network / connectivity error
+//!   3 = bad / unexpected response from server
+//!   4 = wallet not found
+//!   5 = authentication / decryption failure
+//!   6 = unexpected internal error
 
 use clap::{Parser, Subcommand};
-use rustchain_wallet::error::Result;
 use rustchain_wallet::{
     KeyPair, Network, RustChainClient, TransactionBuilder, Wallet, WalletStorage,
 };
@@ -12,7 +20,40 @@ use std::path::PathBuf;
 use tracing::{error, warn};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
+// Exit codes for consistent error handling
+const EXIT_SUCCESS: i32 = 0;
+const EXIT_USAGE_ERROR: i32 = 1;
+const EXIT_NETWORK_ERROR: i32 = 2;
+const EXIT_BAD_RESPONSE: i32 = 3;
+const EXIT_WALLET_NOT_FOUND: i32 = 4;
+const EXIT_AUTH_ERROR: i32 = 5;
+const EXIT_UNKNOWN_ERROR: i32 = 6;
+
+/// Map a WalletError to an exit code and print a descriptive error message to stderr.
+fn exit_code_for_error(err: &rustchain_wallet::WalletError) -> i32 {
+    use rustchain_wallet::WalletError;
+    match err {
+        WalletError::WalletNotFound(_) => EXIT_WALLET_NOT_FOUND,
+        WalletError::Network(_) => EXIT_NETWORK_ERROR,
+        WalletError::InvalidKey(_) | WalletError::InvalidAddress(_) => EXIT_USAGE_ERROR,
+        WalletError::Decryption(_) | WalletError::Encryption(_) | WalletError::Crypto(_) => {
+            EXIT_AUTH_ERROR
+        }
+        WalletError::Storage(_) | WalletError::Io(_) => EXIT_UNKNOWN_ERROR,
+        _ => EXIT_UNKNOWN_ERROR,
+    }
+}
+
 /// RustChain Wallet CLI - Manage your RustChain assets
+///
+/// Exit codes:
+///   0  success
+///   1  usage / input error
+///   2  network / connectivity error
+///   3  bad / unexpected response from server
+///   4  wallet not found
+///   5  authentication / decryption failure
+///   6  unexpected internal error
 #[derive(Parser)]
 #[command(name = "rtc-wallet")]
 #[command(author = "RustChain Contributors")]
@@ -175,7 +216,7 @@ enum Commands {
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> i32 {
     let cli = Cli::parse();
 
     // Initialize logging
@@ -196,24 +237,30 @@ async fn main() -> anyhow::Result<()> {
                 "Invalid network: {}. Use mainnet, testnet, or devnet",
                 cli.network
             );
-            std::process::exit(1);
+            return EXIT_USAGE_ERROR;
         }
     };
 
     // Get wallet storage
-    let storage = if let Some(dir) = cli.wallet_dir {
-        WalletStorage::new(dir)?
+    let storage = match if let Some(dir) = cli.wallet_dir {
+        WalletStorage::new(dir)
     } else {
-        WalletStorage::default()?
+        WalletStorage::default()
+    } {
+        Ok(s) => s,
+        Err(e) => {
+            error!("Storage error: {}", e);
+            return EXIT_UNKNOWN_ERROR;
+        }
     };
 
     // Execute command
     match cli.command {
         Commands::Create { name, format } => {
-            cmd_create(&storage, &name, &format, network)?;
+            cmd_create(&storage, &name, &format, network)
         }
         Commands::Import { name, key } => {
-            cmd_import(&storage, &name, &key)?;
+            cmd_import(&storage, &name, &key)
         }
         Commands::Send {
             from,
@@ -234,10 +281,10 @@ async fn main() -> anyhow::Result<()> {
                 rpc.as_deref().unwrap_or(network.api_url()),
                 simulate,
             )
-            .await?;
+            .await
         }
         Commands::Receive { name } => {
-            cmd_receive(&storage, &name)?;
+            cmd_receive(&storage, &name)
         }
         Commands::Balance { wallet, rpc } => {
             cmd_balance(
@@ -245,50 +292,54 @@ async fn main() -> anyhow::Result<()> {
                 &wallet,
                 rpc.as_deref().unwrap_or(network.api_url()),
             )
-            .await?;
+            .await
         }
         Commands::List => {
-            cmd_list(&storage)?;
+            cmd_list(&storage)
         }
         Commands::Show { name } => {
-            cmd_show(&storage, &name)?;
+            cmd_show(&storage, &name)
         }
         Commands::Export { name } => {
-            cmd_export(&storage, &name)?;
+            cmd_export(&storage, &name)
         }
         Commands::Sign {
             wallet,
             message,
             format,
         } => {
-            cmd_sign(&storage, &wallet, &message, &format)?;
+            cmd_sign(&storage, &wallet, &message, &format)
         }
         Commands::Verify {
             pubkey,
             message,
             signature,
         } => {
-            cmd_verify(&pubkey, &message, &signature)?;
+            cmd_verify(&pubkey, &message, &signature)
         }
         Commands::Network { rpc } => {
-            cmd_network(rpc.as_deref().unwrap_or(network.api_url())).await?;
+            cmd_network(rpc.as_deref().unwrap_or(network.api_url())).await
         }
         Commands::Delete { name, yes } => {
-            cmd_delete(&storage, &name, yes)?;
+            cmd_delete(&storage, &name, yes)
         }
     }
-
-    Ok(())
 }
 
-fn cmd_create(storage: &WalletStorage, name: &str, format: &str, network: Network) -> Result<()> {
+fn cmd_create(storage: &WalletStorage, name: &str, format: &str, network: Network) -> i32 {
     if storage.exists(name) {
         error!("Wallet '{}' already exists", name);
-        std::process::exit(1);
+        return EXIT_USAGE_ERROR;
     }
 
     // Generate new wallet
-    let wallet = Wallet::with_network(KeyPair::generate(), network);
+    let wallet = match Wallet::with_network(KeyPair::generate(), network) {
+        Ok(w) => w,
+        Err(e) => {
+            error!("Failed to generate wallet: {}", e);
+            return EXIT_UNKNOWN_ERROR;
+        }
+    };
     let address = wallet.address();
 
     // Prompt for password
@@ -303,52 +354,69 @@ fn cmd_create(storage: &WalletStorage, name: &str, format: &str, network: Networ
 
     if password != confirm {
         error!("Passwords do not match");
-        std::process::exit(1);
+        return EXIT_USAGE_ERROR;
     }
 
     // Save wallet
-    let path = storage.save(name, wallet.keypair(), &password)?;
-
-    match format {
-        "json" => {
-            println!(
-                "{}",
-                serde_json::json!({
-                    "name": name,
-                    "address": address,
-                    "public_key": wallet.public_key(),
-                    "network": network.to_string(),
-                    "storage_path": path.display().to_string()
-                })
-            );
+    match storage.save(name, wallet.keypair(), &password) {
+        Ok(path) => {
+            match format {
+                "json" => {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "name": name,
+                            "address": address,
+                            "public_key": wallet.public_key(),
+                            "network": network.to_string(),
+                            "storage_path": path.display().to_string()
+                        })
+                    );
+                }
+                _ => {
+                    println!("Wallet created successfully!");
+                    println!();
+                    println!("Name:         {}", name);
+                    println!("Address:      {}", address);
+                    println!("Public Key:   {}", wallet.public_key());
+                    println!("Network:      {}", network);
+                    println!("Storage:      {}", path.display());
+                    println!();
+                    println!("IMPORTANT: Store your password securely. It cannot be recovered!");
+                }
+            }
+            EXIT_SUCCESS
         }
-        _ => {
-            println!("Wallet created successfully!");
-            println!();
-            println!("Name:         {}", name);
-            println!("Address:      {}", address);
-            println!("Public Key:   {}", wallet.public_key());
-            println!("Network:      {}", network);
-            println!("Storage:      {}", path.display());
-            println!();
-            println!("IMPORTANT: Store your password securely. It cannot be recovered!");
+        Err(e) => {
+            error!("Failed to save wallet: {}", e);
+            EXIT_UNKNOWN_ERROR
         }
     }
-
-    Ok(())
 }
 
-fn cmd_import(storage: &WalletStorage, name: &str, key: &str) -> Result<()> {
+fn cmd_import(storage: &WalletStorage, name: &str, key: &str) -> i32 {
     if storage.exists(name) {
         error!("Wallet '{}' already exists", name);
-        std::process::exit(1);
+        return EXIT_USAGE_ERROR;
     }
 
     // Try to parse key (hex first, then base58)
     let keypair = if key.len() == 64 && key.chars().all(|c| c.is_ascii_hexdigit()) {
-        KeyPair::from_hex(key)?
+        match KeyPair::from_hex(key) {
+            Ok(k) => k,
+            Err(e) => {
+                error!("Invalid hex key: {}", e);
+                return EXIT_USAGE_ERROR;
+            }
+        }
     } else {
-        KeyPair::from_base58(key)?
+        match KeyPair::from_base58(key) {
+            Ok(k) => k,
+            Err(e) => {
+                error!("Invalid key format: {}", e);
+                return EXIT_USAGE_ERROR;
+            }
+        }
     };
 
     let address = keypair.rtc_address();
@@ -362,17 +430,22 @@ fn cmd_import(storage: &WalletStorage, name: &str, key: &str) -> Result<()> {
 
     if password != confirm {
         error!("Passwords do not match");
-        std::process::exit(1);
+        return EXIT_USAGE_ERROR;
     }
 
-    storage.save(name, &keypair, &password)?;
-
-    println!("Wallet imported successfully!");
-    println!();
-    println!("Name:     {}", name);
-    println!("Address:  {}", address);
-
-    Ok(())
+    match storage.save(name, &keypair, &password) {
+        Ok(_) => {
+            println!("Wallet imported successfully!");
+            println!();
+            println!("Name:     {}", name);
+            println!("Address:  {}", address);
+            EXIT_SUCCESS
+        }
+        Err(e) => {
+            error!("Failed to save wallet: {}", e);
+            EXIT_UNKNOWN_ERROR
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -385,16 +458,22 @@ async fn cmd_send(
     memo: Option<&str>,
     api_url: &str,
     simulate: bool,
-) -> Result<()> {
+) -> i32 {
     if !storage.exists(from) {
         error!("Wallet '{}' not found", from);
-        std::process::exit(1);
+        return EXIT_WALLET_NOT_FOUND;
     }
 
     let password =
         rpassword::prompt_password("Enter wallet password: ").unwrap_or_else(|_| String::new());
 
-    let keypair = storage.load(from, &password)?;
+    let keypair = match storage.load(from, &password) {
+        Ok(k) => k,
+        Err(e) => {
+            error!("Failed to load wallet: {}", e);
+            return EXIT_AUTH_ERROR;
+        }
+    };
     let from_address = keypair.rtc_address();
 
     let client = RustChainClient::new(api_url.to_string());
@@ -406,27 +485,45 @@ async fn cmd_send(
     let fee = fee.unwrap_or(1000);
 
     // Create transaction
-    let mut tx = TransactionBuilder::new()
+    let mut tx = match TransactionBuilder::new()
         .from(from_address.clone())
         .to(to.to_string())
         .amount(amount)
         .fee(fee)
         .nonce(nonce)
-        .build()?;
+        .build()
+    {
+        Ok(t) => t,
+        Err(e) => {
+            error!("Failed to build transaction: {}", e);
+            return EXIT_UNKNOWN_ERROR;
+        }
+    };
 
     if let Some(m) = memo {
         tx = tx.with_memo(m.to_string());
     }
 
     // Sign transaction
-    tx.sign(&keypair)?;
+    if let Err(e) = tx.sign(&keypair) {
+        error!("Failed to sign transaction: {}", e);
+        return EXIT_AUTH_ERROR;
+    }
 
     if simulate {
-        println!("Simulated transaction:");
-        println!("{}", tx.to_json()?);
-        println!();
-        println!("Transaction simulation successful");
-        return Ok(());
+        match tx.to_json() {
+            Ok(json) => {
+                println!("Simulated transaction:");
+                println!("{}", json);
+                println!();
+                println!("Transaction simulation successful");
+            }
+            Err(e) => {
+                error!("Failed to serialize transaction: {}", e);
+                return EXIT_UNKNOWN_ERROR;
+            }
+        }
+        return EXIT_SUCCESS;
     }
 
     // Submit transaction
@@ -439,26 +536,31 @@ async fn cmd_send(
             if let Some(block) = response.block_height {
                 println!("Block:   {}", block);
             }
+            EXIT_SUCCESS
         }
         Err(e) => {
             error!("Failed to submit transaction: {}", e);
-            std::process::exit(1);
+            exit_code_for_error(&e)
         }
     }
-
-    Ok(())
 }
 
-fn cmd_receive(storage: &WalletStorage, name: &str) -> Result<()> {
+fn cmd_receive(storage: &WalletStorage, name: &str) -> i32 {
     if !storage.exists(name) {
         error!("Wallet '{}' not found", name);
-        std::process::exit(1);
+        return EXIT_WALLET_NOT_FOUND;
     }
 
     let password =
         rpassword::prompt_password("Enter wallet password: ").unwrap_or_else(|_| String::new());
 
-    let keypair = storage.load(name, &password)?;
+    let keypair = match storage.load(name, &password) {
+        Ok(k) => k,
+        Err(e) => {
+            error!("Failed to load wallet: {}", e);
+            return EXIT_AUTH_ERROR;
+        }
+    };
     let address = keypair.rtc_address();
 
     println!("Receive RTC at this address:");
@@ -468,14 +570,14 @@ fn cmd_receive(storage: &WalletStorage, name: &str) -> Result<()> {
     println!("Share this address with the sender.");
     println!("Public Key: {}", keypair.public_key_hex());
 
-    Ok(())
+    EXIT_SUCCESS
 }
 
 async fn cmd_balance(
     storage: &WalletStorage,
     wallet_or_address: &str,
     api_url: &str,
-) -> Result<()> {
+) -> i32 {
     let client = RustChainClient::new(api_url.to_string());
 
     // If it starts with RTC, treat as address; otherwise look up wallet name
@@ -484,7 +586,13 @@ async fn cmd_balance(
     } else if storage.exists(wallet_or_address) {
         let password =
             rpassword::prompt_password("Enter wallet password: ").unwrap_or_else(|_| String::new());
-        let keypair = storage.load(wallet_or_address, &password)?;
+        let keypair = match storage.load(wallet_or_address, &password) {
+            Ok(k) => k,
+            Err(e) => {
+                error!("Failed to load wallet: {}", e);
+                return EXIT_AUTH_ERROR;
+            }
+        };
         keypair.rtc_address()
     } else {
         // Treat as raw address
@@ -500,23 +608,28 @@ async fn cmd_balance(
                 println!("  Locked:    {:.4} RTC", balance.locked);
             }
             println!("  Nonce:     {}", balance.nonce);
+            EXIT_SUCCESS
         }
         Err(e) => {
-            error!("Failed to get balance: {}", e);
-            std::process::exit(1);
+            error!("{}", e);
+            exit_code_for_error(&e)
         }
     }
-
-    Ok(())
 }
 
-fn cmd_list(storage: &WalletStorage) -> Result<()> {
-    let wallets = storage.list()?;
+fn cmd_list(storage: &WalletStorage) -> i32 {
+    let wallets = match storage.list() {
+        Ok(w) => w,
+        Err(e) => {
+            error!("Failed to list wallets: {}", e);
+            return EXIT_UNKNOWN_ERROR;
+        }
+    };
 
     if wallets.is_empty() {
         println!("No wallets found in storage.");
         println!("Use 'rtc-wallet create --name <name>' to create a new wallet.");
-        return Ok(());
+        return EXIT_SUCCESS;
     }
 
     println!("Stored wallets:");
@@ -527,32 +640,38 @@ fn cmd_list(storage: &WalletStorage) -> Result<()> {
     println!();
     println!("Total: {} wallet(s)", wallets.len());
 
-    Ok(())
+    EXIT_SUCCESS
 }
 
-fn cmd_show(storage: &WalletStorage, name: &str) -> Result<()> {
+fn cmd_show(storage: &WalletStorage, name: &str) -> i32 {
     if !storage.exists(name) {
         error!("Wallet '{}' not found", name);
-        std::process::exit(1);
+        return EXIT_WALLET_NOT_FOUND;
     }
 
     let password =
         rpassword::prompt_password("Enter wallet password: ").unwrap_or_else(|_| String::new());
 
-    let keypair = storage.load(name, &password)?;
+    let keypair = match storage.load(name, &password) {
+        Ok(k) => k,
+        Err(e) => {
+            error!("Failed to load wallet: {}", e);
+            return EXIT_AUTH_ERROR;
+        }
+    };
     let address = keypair.rtc_address();
 
     println!("Wallet: {}", name);
     println!("Address:    {}", address);
     println!("Public Key: {}", keypair.public_key_hex());
 
-    Ok(())
+    EXIT_SUCCESS
 }
 
-fn cmd_export(storage: &WalletStorage, name: &str) -> Result<()> {
+fn cmd_export(storage: &WalletStorage, name: &str) -> i32 {
     if !storage.exists(name) {
         error!("Wallet '{}' not found", name);
-        std::process::exit(1);
+        return EXIT_WALLET_NOT_FOUND;
     }
 
     warn!("WARNING: You are about to export your private key!");
@@ -564,13 +683,19 @@ fn cmd_export(storage: &WalletStorage, name: &str) -> Result<()> {
 
     if confirm != "YES" {
         println!("Export cancelled.");
-        return Ok(());
+        return EXIT_SUCCESS;
     }
 
     let password =
         rpassword::prompt_password("Enter wallet password: ").unwrap_or_else(|_| String::new());
 
-    let keypair = storage.load(name, &password)?;
+    let keypair = match storage.load(name, &password) {
+        Ok(k) => k,
+        Err(e) => {
+            error!("Failed to load wallet: {}", e);
+            return EXIT_AUTH_ERROR;
+        }
+    };
     let private_key = keypair.export_private_key();
 
     println!();
@@ -579,20 +704,32 @@ fn cmd_export(storage: &WalletStorage, name: &str) -> Result<()> {
     println!();
     warn!("Store this key securely and delete it from your terminal history!");
 
-    Ok(())
+    EXIT_SUCCESS
 }
 
-fn cmd_sign(storage: &WalletStorage, wallet: &str, message: &str, format: &str) -> Result<()> {
+fn cmd_sign(storage: &WalletStorage, wallet: &str, message: &str, format: &str) -> i32 {
     if !storage.exists(wallet) {
         error!("Wallet '{}' not found", wallet);
-        std::process::exit(1);
+        return EXIT_WALLET_NOT_FOUND;
     }
 
     let password =
         rpassword::prompt_password("Enter wallet password: ").unwrap_or_else(|_| String::new());
 
-    let keypair = storage.load(wallet, &password)?;
-    let signature = keypair.sign(message.as_bytes())?;
+    let keypair = match storage.load(wallet, &password) {
+        Ok(k) => k,
+        Err(e) => {
+            error!("Failed to load wallet: {}", e);
+            return EXIT_AUTH_ERROR;
+        }
+    };
+    let signature = match keypair.sign(message.as_bytes()) {
+        Ok(s) => s,
+        Err(e) => {
+            error!("Failed to sign message: {}", e);
+            return EXIT_AUTH_ERROR;
+        }
+    };
 
     match format {
         "base64" => {
@@ -607,32 +744,48 @@ fn cmd_sign(storage: &WalletStorage, wallet: &str, message: &str, format: &str) 
         }
     }
 
-    Ok(())
+    EXIT_SUCCESS
 }
 
-fn cmd_verify(pubkey: &str, message: &str, signature: &str) -> Result<()> {
+fn cmd_verify(pubkey: &str, message: &str, signature: &str) -> i32 {
     // Parse public key from hex
-    let keypair = KeyPair::from_hex(pubkey)?;
+    let keypair = match KeyPair::from_hex(pubkey) {
+        Ok(k) => k,
+        Err(e) => {
+            error!("Invalid public key: {}", e);
+            return EXIT_USAGE_ERROR;
+        }
+    };
 
     // Parse signature
-    let sig_bytes = hex::decode(signature)
-        .map_err(|e| rustchain_wallet::WalletError::InvalidSignature(e.to_string()))?;
+    let sig_bytes = match hex::decode(signature) {
+        Ok(b) => b,
+        Err(e) => {
+            error!("Invalid signature hex: {}", e);
+            return EXIT_USAGE_ERROR;
+        }
+    };
 
-    let valid = keypair.verify(message.as_bytes(), &sig_bytes)?;
+    let valid = match keypair.verify(message.as_bytes(), &sig_bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            error!("Signature verification error: {}", e);
+            return EXIT_AUTH_ERROR;
+        }
+    };
 
     if valid {
         println!("Signature is VALID");
         println!("  Public Key: {}", pubkey);
         println!("  Message:    {}", message);
+        EXIT_SUCCESS
     } else {
         error!("Signature is INVALID");
-        std::process::exit(1);
+        EXIT_AUTH_ERROR
     }
-
-    Ok(())
 }
 
-async fn cmd_network(api_url: &str) -> Result<()> {
+async fn cmd_network(api_url: &str) -> i32 {
     let client = RustChainClient::new(api_url.to_string());
 
     match client.get_network_info().await {
@@ -644,20 +797,19 @@ async fn cmd_network(api_url: &str) -> Result<()> {
             println!("  Peers:         {}", info.peer_count);
             println!("  Min Fee:       {} RTC", info.min_fee);
             println!("  Version:       {}", info.version);
+            EXIT_SUCCESS
         }
         Err(e) => {
             error!("Failed to get network info: {}", e);
-            std::process::exit(1);
+            exit_code_for_error(&e)
         }
     }
-
-    Ok(())
 }
 
-fn cmd_delete(storage: &WalletStorage, name: &str, yes: bool) -> Result<()> {
+fn cmd_delete(storage: &WalletStorage, name: &str, yes: bool) -> i32 {
     if !storage.exists(name) {
         error!("Wallet '{}' not found", name);
-        std::process::exit(1);
+        return EXIT_WALLET_NOT_FOUND;
     }
 
     if !yes {
@@ -670,12 +822,18 @@ fn cmd_delete(storage: &WalletStorage, name: &str, yes: bool) -> Result<()> {
 
         if confirm != "DELETE" {
             println!("Deletion cancelled.");
-            return Ok(());
+            return EXIT_SUCCESS;
         }
     }
 
-    storage.delete(name)?;
-    println!("Wallet '{}' deleted successfully", name);
-
-    Ok(())
+    match storage.delete(name) {
+        Ok(_) => {
+            println!("Wallet '{}' deleted successfully", name);
+            EXIT_SUCCESS
+        }
+        Err(e) => {
+            error!("Failed to delete wallet: {}", e);
+            EXIT_UNKNOWN_ERROR
+        }
+    }
 }
